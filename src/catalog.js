@@ -1,4 +1,11 @@
 import { db, firebase } from "./firebase.js";
+import {
+  CATALOG_COVER_VERSION,
+  createCatalogPreview,
+  readCachedCatalogCover,
+  cacheCatalogCover,
+  removeCachedCatalogCover,
+} from "./catalog-images.js";
 
 export function initializeCatalog(root) {
   let disposed = false;
@@ -57,12 +64,32 @@ export function initializeCatalog(root) {
 
   const itemsCol = db.collection("furniture_items");
   const itemImagesCol = db.collection("furniture_item_images");
+  const itemCoversCol = db.collection("furniture_item_covers");
   const counterRef = db.collection("meta").doc("counter");
 
   let ALL_ITEMS = [];
   let activeCategory = "all";
+  let activeSearch = "";
+  let optimizing = false;
   const fullImagesCache = {};
   const fullImagesRequests = new Map();
+  const coversCache = new Map();
+  const coverRequests = new Map();
+  const imageKey = (item) => `${item.id}:${item.imageRevision || "legacy"}`;
+  const placeholder =
+    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='3'/%3E";
+  const escapeHtml = (value) =>
+    String(value ?? "").replace(
+      /[&<>"']/g,
+      (char) =>
+        ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        })[char],
+    );
 
   /* ---------- BOOT ---------- */
   const app = find("app");
@@ -84,38 +111,90 @@ export function initializeCatalog(root) {
   }
 
   /* ---------- IMAGE HELPERS ---------- */
-  // Legacy items keep their full-size images inline on the doc; newer items
-  // only carry a small "thumb" here. Visible cards and the lightbox share
-  // full-image requests so sharp photos load without downloading the whole catalog.
-  function itemImages(i) {
-    return i.images && i.images.length ? i.images : i.image ? [i.image] : [];
+  function itemImages(item) {
+    return item.images?.length ? item.images : item.image ? [item.image] : [];
   }
 
-  function itemThumbSrc(i) {
-    return i.thumb || itemImages(i)[0] || "";
+  function itemThumbSrc(item) {
+    return item.thumb || itemImages(item)[0] || placeholder;
   }
 
-  function itemImageCount(i) {
-    return i.imageCount || itemImages(i).length;
+  function itemImageCount(item) {
+    return item.imageCount || itemImages(item).length;
   }
 
   async function getFullImages(item) {
     const inline = itemImages(item);
     if (inline.length) return inline;
-    if (fullImagesCache[item.id]) return fullImagesCache[item.id];
-    if (!fullImagesRequests.has(item.id)) {
+    const key = imageKey(item);
+    if (fullImagesCache[key]) return fullImagesCache[key];
+    if (!fullImagesRequests.has(key)) {
       const request = itemImagesCol
         .doc(item.id)
         .get()
         .then((doc) => {
-          const imgs = doc.exists && doc.data().images ? doc.data().images : [];
-          if (imgs.length) fullImagesCache[item.id] = imgs;
-          return imgs;
+          const images = doc.exists ? doc.data().images || [] : [];
+          if (images.length) fullImagesCache[key] = images;
+          return images;
         })
-        .finally(() => fullImagesRequests.delete(item.id));
-      fullImagesRequests.set(item.id, request);
+        .finally(() => fullImagesRequests.delete(key));
+      fullImagesRequests.set(key, request);
     }
-    return fullImagesRequests.get(item.id);
+    return fullImagesRequests.get(key);
+  }
+
+  async function getCatalogCover(item) {
+    const key = imageKey(item);
+    if (coversCache.has(key)) return coversCache.get(key);
+    if (!coverRequests.has(key)) {
+      const request = (async () => {
+        // Old records remain sharp until their one-time optimization is complete.
+        if (
+          item.coverVersion !== CATALOG_COVER_VERSION ||
+          !item.imageRevision
+        ) {
+          const images = await getFullImages(item);
+          if (!images[0]) throw new Error("No source photo");
+          return createCatalogPreview(images[0]);
+        }
+        const cacheKey = `furnizapchast-4a429:cover:${CATALOG_COVER_VERSION}:${key}`;
+        const cached = await readCachedCatalogCover(cacheKey);
+        if (cached) return cached;
+        const doc = await itemCoversCol.doc(item.id).get();
+        const cover = doc.exists ? doc.data() : null;
+        if (!cover?.image || cover.imageRevision !== item.imageRevision) {
+          throw new Error("Catalog cover is missing or outdated");
+        }
+        return cover;
+      })()
+        .then(async (cover) => {
+          // Validate before caching, even if the original card was removed meanwhile.
+          const decoded = new Image();
+          decoded.src = cover.image;
+          await decoded.decode();
+          coversCache.set(key, cover);
+          if (
+            item.coverVersion === CATALOG_COVER_VERSION &&
+            item.imageRevision
+          ) {
+            void cacheCatalogCover(
+              `furnizapchast-4a429:cover:${CATALOG_COVER_VERSION}:${key}`,
+              cover,
+            );
+          }
+          return cover;
+        })
+        .catch((error) => {
+          coversCache.delete(key);
+          void removeCachedCatalogCover(
+            `furnizapchast-4a429:cover:${CATALOG_COVER_VERSION}:${key}`,
+          );
+          throw error;
+        })
+        .finally(() => coverRequests.delete(key));
+      coverRequests.set(key, request);
+    }
+    return coverRequests.get(key);
   }
 
   /* ---------- CATEGORY RAIL ---------- */
@@ -131,6 +210,8 @@ export function initializeCatalog(root) {
     rail.querySelectorAll(".cat-chip").forEach((chip) => {
       listen(chip, "click", () => {
         activeCategory = chip.dataset.cat;
+        activeSearch = "";
+        find("idSearch").value = "";
         renderCategoryRail();
         renderGrid();
       });
@@ -154,9 +235,22 @@ export function initializeCatalog(root) {
     unsubscribeItems = itemsCol.orderBy("createdAt", "desc").onSnapshot(
       (snap) => {
         if (disposed) return;
-        ALL_ITEMS = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        const nextItems = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        const nextById = new Map(nextItems.map((item) => [item.id, item]));
+        ALL_ITEMS.forEach((item) => {
+          const next = nextById.get(item.id);
+          if (
+            !next ||
+            imageKey(next) !== imageKey(item) ||
+            next.thumb !== item.thumb
+          ) {
+            delete fullImagesCache[imageKey(item)];
+            coversCache.delete(imageKey(item));
+          }
+        });
+        ALL_ITEMS = nextItems;
         renderGrid();
-        renderAdminList();
+        if (find("adminPanel").style.display === "block") renderAdminList();
       },
       (err) => {
         if (disposed) return;
@@ -167,15 +261,14 @@ export function initializeCatalog(root) {
     );
   }
 
-  /* Каталог сразу отображается (теги, категории и т.д.), а сами фото
-     подгружаются отдельной очередью: не больше IMG_CONCURRENCY штук
-     одновременно, и только когда карточка появляется в зоне видимости —
-     поэтому страница не виснет, даже если товаров много. */
+  /* ---------- LAZY CATALOG COVERS ---------- */
   const IMG_CONCURRENCY = 5;
   let imgActive = 0;
   const imgQueue = [];
 
   function queueImageLoad(img) {
+    img.closest(".card-img-wrap").classList.remove("image-error");
+    img.closest(".card-img-wrap").classList.add("image-loading");
     imgQueue.push(img);
     pumpImageQueue();
   }
@@ -183,7 +276,12 @@ export function initializeCatalog(root) {
   function pumpImageQueue() {
     while (!disposed && imgActive < IMG_CONCURRENCY && imgQueue.length) {
       const img = imgQueue.shift();
-      if (disposed || !img.isConnected) continue;
+      if (!img.isConnected) continue;
+      const rect = img.getBoundingClientRect();
+      if (rect.bottom < -300 || rect.top > window.innerHeight + 300) {
+        gridImgObserver.observe(img);
+        continue;
+      }
       imgActive++;
       loadGridImage(img).finally(() => {
         imgActive--;
@@ -193,24 +291,23 @@ export function initializeCatalog(root) {
   }
 
   async function loadGridImage(img) {
-    // Keep the fast preview visible until the full-size photo has been decoded.
-    const preview = img.dataset.src;
-    if (preview) img.src = preview;
-    delete img.dataset.src;
-    const item = ALL_ITEMS.find((i) => i.id === img.dataset.itemId);
+    const item = ALL_ITEMS.find((entry) => entry.id === img.dataset.itemId);
     if (!item) return;
+    const wrap = img.closest(".card-img-wrap");
     try {
-      const images = await getFullImages(item);
-      const src = images[0];
-      if (!src || src === preview || disposed || !img.isConnected) return;
-      const fullImage = new Image();
-      fullImage.decoding = "async";
-      fullImage.src = src;
-      await fullImage.decode();
-      if (!disposed && img.isConnected) img.src = src;
+      const cover = await getCatalogCover(item);
+      if (disposed || !img.isConnected) return;
+      img.src = cover.image;
+      wrap.classList.remove("image-loading", "image-error");
     } catch (err) {
-      // A failed full-image request leaves the preview usable and can be retried.
-      console.warn("Could not load full-size catalog photo:", item.id, err);
+      if (disposed || !img.isConnected) return;
+      coversCache.delete(imageKey(item));
+      void removeCachedCatalogCover(
+        `furnizapchast-4a429:cover:${CATALOG_COVER_VERSION}:${imageKey(item)}`,
+      );
+      wrap.classList.remove("image-loading");
+      wrap.classList.add("image-error");
+      console.warn("Could not load catalog cover:", item.id, err);
     }
   }
 
@@ -226,55 +323,63 @@ export function initializeCatalog(root) {
     { rootMargin: "300px 0px" },
   );
 
-  function renderGrid(filtered) {
+  function renderGrid() {
     const grid = find("grid");
     gridImgObserver.disconnect();
     imgQueue.length = 0;
-    let items = filtered || ALL_ITEMS;
-    if (!filtered) {
-      items =
-        activeCategory === "all"
-          ? ALL_ITEMS
-          : ALL_ITEMS.filter((i) => i.category === activeCategory);
+    let items =
+      activeCategory === "all"
+        ? ALL_ITEMS
+        : ALL_ITEMS.filter((item) => item.category === activeCategory);
+    if (activeSearch) {
+      items = ALL_ITEMS.filter((item) =>
+        item.tag.toUpperCase().includes(activeSearch),
+      );
     }
-    if (items.length === 0) {
+    if (!items.length) {
       grid.innerHTML = `<div class="empty"><b>Ничего не найдено</b>Попробуйте другую категорию или ID.</div>`;
       return;
     }
     grid.innerHTML = items
-      .map((i) => {
-        const count = itemImageCount(i);
+      .map((item) => {
+        const count = itemImageCount(item);
+        const cached = coversCache.get(imageKey(item));
         return `
-      <div class="card" data-id="${i.id}">
-        <div class="card-img-wrap">
-          <img class="card-img" data-item-id="${i.id}" data-src="${itemThumbSrc(i)}" alt="${i.tag}" loading="lazy" decoding="async">
-          ${count > 1 ? `<span class="card-img-count">1/${count}</span>` : ""}
-        </div>
-        <div class="card-body">
-          <span class="card-tag">${i.tag}</span>
-          <span class="card-cat">${catLabel(i.category)}</span>
-        </div>
-      </div>
-    `;
+        <div class="card" data-id="${item.id}" tabindex="0" role="button" aria-label="${escapeHtml(item.tag)}">
+          <div class="card-img-wrap ${cached ? "" : "image-loading"}">
+            <img class="card-img" data-item-id="${item.id}" src="${cached?.image || placeholder}" alt="${escapeHtml(item.tag)}" width="1440" height="1080" loading="lazy" decoding="async">
+            <button class="image-retry" type="button">Повторить загрузку</button>
+            ${count > 1 ? `<span class="card-img-count">1/${count}</span>` : ""}
+          </div>
+          <div class="card-body">
+            <span class="card-tag">${escapeHtml(item.tag)}</span>
+            <span class="card-cat">${escapeHtml(catLabel(item.category))}</span>
+          </div>
+        </div>`;
       })
       .join("");
     grid.querySelectorAll(".card").forEach((card) => {
       listen(card, "click", () => openLightbox(card.dataset.id));
+      listen(card, "keydown", (event) => {
+        if (event.target === card && ["Enter", " "].includes(event.key)) {
+          event.preventDefault();
+          openLightbox(card.dataset.id);
+        }
+      });
+      listen(card.querySelector(".image-retry"), "click", (event) => {
+        event.stopPropagation();
+        queueImageLoad(card.querySelector(".card-img"));
+      });
     });
-    grid
-      .querySelectorAll(".card-img")
-      .forEach((img) => gridImgObserver.observe(img));
+    grid.querySelectorAll(".card-img").forEach((img) => {
+      if (img.src === placeholder) gridImgObserver.observe(img);
+    });
   }
 
   /* ---------- ID SEARCH ---------- */
   function doSearch() {
-    const raw = find("idSearch").value.trim().toUpperCase().replace("#", "");
-    if (!raw) {
-      renderGrid();
-      return;
-    }
-    const found = ALL_ITEMS.filter((i) => i.tag.toUpperCase().includes(raw));
-    renderGrid(found);
+    activeSearch = find("idSearch").value.trim().toUpperCase().replace("#", "");
+    renderGrid();
   }
   listen(find("idSearchBtn"), "click", doSearch);
   listen(find("idSearch"), "keydown", (e) => {
@@ -285,11 +390,13 @@ export function initializeCatalog(root) {
   let lbImages = [];
   let lbIndex = 0;
   let lbRequestId = 0;
+  let currentLightboxId = null;
 
   async function openLightbox(id) {
     const item = ALL_ITEMS.find((i) => i.id === id);
     if (!item) return;
     const requestId = ++lbRequestId;
+    currentLightboxId = id;
     find("lbTag").textContent = item.tag;
     find("lbCat").textContent = catLabel(item.category);
     const specs = item.specs || [];
@@ -297,13 +404,15 @@ export function initializeCatalog(root) {
     find("lbSpecs").innerHTML = specs
       .map(
         (s) =>
-          `<div class="spec-line"><span class="spec-k">${s.name}:</span><span class="spec-v">${s.value}</span></div>`,
+          `<div class="spec-line"><span class="spec-k">${escapeHtml(s.name)}:</span><span class="spec-v">${escapeHtml(s.value)}</span></div>`,
       )
       .join("");
 
-    // Reuse full-quality photos already loaded by a visible catalog card.
-    lbImages = fullImagesCache[id] || itemImages(item);
-    if (!lbImages.length) lbImages = item.thumb ? [item.thumb] : [];
+    lbImages = fullImagesCache[imageKey(item)] || itemImages(item);
+    const cover = coversCache.get(imageKey(item));
+    if (!lbImages.length) lbImages = cover ? [cover.image] : [];
+    find("lbLoadStatus").textContent = "Загрузка фотографий…";
+    find("lbRetry").hidden = true;
     lbIndex = 0;
     renderLbImage();
 
@@ -319,11 +428,24 @@ export function initializeCatalog(root) {
         lbImages = fullImages;
         lbIndex = 0;
         renderLbImage();
+        find("lbLoadStatus").textContent = "";
+      } else if (!disposed && requestId === lbRequestId) {
+        throw new Error("No product photos");
       }
     } catch (err) {
+      if (!disposed && requestId === lbRequestId) {
+        find("lbLoadStatus").textContent =
+          "Не удалось загрузить фото. Попробуйте ещё раз.";
+        find("lbRetry").hidden = false;
+        find("lbLoader").style.display = "none";
+      }
       console.warn("Could not load full-size product photos:", id, err);
     }
   }
+
+  listen(find("lbRetry"), "click", () => {
+    if (currentLightboxId) openLightbox(currentLightboxId);
+  });
 
   function closeLightbox() {
     const requestId = ++lbRequestId;
@@ -540,6 +662,7 @@ export function initializeCatalog(root) {
     if (pass === ADMIN_PASSWORD) {
       app.style.display = "none";
       find("adminPanel").style.display = "block";
+      renderAdminList();
     } else if (pass !== null) {
       alert("Неверный пароль");
     }
@@ -585,13 +708,11 @@ export function initializeCatalog(root) {
   listen(find("addSpecBtn"), "click", () => addSpecRow());
   resetSpecFields();
 
-  /* ---------- IMAGE COMPRESSION + UPLOAD ----------
-     Photos are compressed client-side and stored as base64 text directly on
-     the Firestore documents (Storage needs the Blaze billing plan, which this
-     project isn't on) — so sizes stay well under Firestore's 1MB/document cap. */
+  /* ---------- IMAGE PREPARATION + ATOMIC UPLOAD ---------- */
   let pendingImages = [];
-  let pendingThumb = null;
-
+  let pendingCover = null;
+  let selectionVersion = 0;
+  let preparingImages = false;
   const uploadCatSelect = find("uploadCat");
   const fileInput = find("fileInput");
   const previewThumbs = find("previewThumbs");
@@ -603,110 +724,166 @@ export function initializeCatalog(root) {
       "Нажмите или перетащите изображения сюда (можно несколько)";
   }
 
-  listen(fileInput, "change", async () => {
-    const files = Array.from(fileInput.files || []);
-    if (files.length === 0) return;
-    pendingImages = await Promise.all(
-      files.map((f) => compressImage(f, 1200, 0.85)),
-    );
-    pendingThumb = await compressImage(files[0], 1200, 0.85);
-    previewThumbs.innerHTML = pendingImages
-      .map((src) => `<img src="${src}">`)
-      .join("");
-    dropLabel.textContent =
-      files.length === 1 ? files[0].name : `${files.length} файлов выбрано`;
+  // Leave room for Firestore's field/document overhead; validate before any write.
+  function validateImageDocument(data) {
+    if (new TextEncoder().encode(JSON.stringify(data)).length > 950000) {
+      throw new Error(
+        "Фотографии слишком большие. Выберите меньше фотографий для одного изделия.",
+      );
+    }
+  }
+
+  async function prepareFiles(files) {
+    const version = ++selectionVersion;
+    pendingImages = [];
+    pendingCover = null;
+    previewThumbs.innerHTML = "";
+    const status = find("uploadStatus");
+    status.textContent = "";
+    status.className = "status-msg";
+    preparingImages = files.length > 0;
+    find("uploadBtn").disabled = preparingImages;
+    if (!files.length) {
+      updateFileInputMode();
+      return;
+    }
+    status.textContent = "Подготовка фотографий…";
+    try {
+      const images = await Promise.all(
+        files.map((file) => compressImage(file, 1200, 0.85)),
+      );
+      const cover = await createCatalogPreview(files[0]);
+      validateImageDocument({ images });
+      validateImageDocument({ image: cover.image });
+      if (disposed || version !== selectionVersion) return;
+      pendingImages = images;
+      pendingCover = cover;
+      previewThumbs.innerHTML = images
+        .map((image) => `<img src="${image}" alt="Выбранное фото">`)
+        .join("");
+      dropLabel.textContent =
+        files.length === 1 ? files[0].name : `${files.length} файлов выбрано`;
+      status.textContent = "";
+    } catch (err) {
+      if (disposed || version !== selectionVersion) return;
+      status.textContent =
+        err.message ||
+        "Не удалось прочитать фото. Выберите другое изображение.";
+      status.className = "status-msg err";
+      updateFileInputMode();
+    } finally {
+      if (!disposed && version === selectionVersion) {
+        preparingImages = false;
+        find("uploadBtn").disabled = false;
+      }
+    }
+  }
+
+  listen(fileInput, "change", () =>
+    prepareFiles(Array.from(fileInput.files || [])),
+  );
+  listen(find("dropZone"), "dragover", (event) => event.preventDefault());
+  listen(find("dropZone"), "drop", (event) => {
+    event.preventDefault();
+    if (!fileInput.disabled)
+      prepareFiles(Array.from(event.dataTransfer.files || []));
   });
 
   function compressImage(file, maxWidth, quality) {
     return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const img = new Image();
-        img.onload = () => {
-          let w = img.width,
-            h = img.height;
-          if (w > maxWidth) {
-            h = Math.round(h * (maxWidth / w));
-            w = maxWidth;
-          }
-          const canvas = document.createElement("canvas");
-          canvas.width = w;
-          canvas.height = h;
-          canvas.getContext("2d").drawImage(img, 0, 0, w, h);
-          resolve(canvas.toDataURL("image/jpeg", quality));
-        };
-        img.onerror = reject;
-        img.src = e.target.result;
-      };
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
-  }
-
-  function compressDataUrl(dataUrl, maxWidth, quality) {
-    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
       const img = new Image();
       img.onload = () => {
-        let w = img.width,
-          h = img.height;
-        if (w > maxWidth) {
-          h = Math.round(h * (maxWidth / w));
-          w = maxWidth;
+        try {
+          const width = Math.min(img.naturalWidth, maxWidth);
+          const height = Math.round(
+            (img.naturalHeight * width) / img.naturalWidth,
+          );
+          const canvas = document.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+          const context = canvas.getContext("2d");
+          context.imageSmoothingQuality = "high";
+          context.drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL("image/jpeg", quality));
+        } catch (err) {
+          reject(err);
+        } finally {
+          URL.revokeObjectURL(url);
         }
-        const canvas = document.createElement("canvas");
-        canvas.width = w;
-        canvas.height = h;
-        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
-        resolve(canvas.toDataURL("image/jpeg", quality));
       };
-      img.onerror = reject;
-      img.src = dataUrl;
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(
+          new Error("Не удалось прочитать фото. Выберите другое изображение."),
+        );
+      };
+      img.src = url;
     });
   }
 
   listen(find("uploadBtn"), "click", async () => {
     const statusEl = find("uploadStatus");
     const btn = find("uploadBtn");
-    const category = uploadCatSelect.value;
-    const specs = collectSpecs();
-
-    if (pendingImages.length === 0) {
+    if (preparingImages || btn.disabled) return;
+    if (!pendingImages.length || !pendingCover) {
       statusEl.textContent = "Выберите изображение";
       statusEl.className = "status-msg err";
       return;
     }
-
     btn.disabled = true;
-    statusEl.textContent = "Загрузка...";
+    fileInput.disabled = true;
+    statusEl.textContent = "Загрузка…";
     statusEl.className = "status-msg";
-
     try {
+      const images = pendingImages;
+      const category = uploadCatSelect.value;
+      const specs = collectSpecs();
+      const { image, thumb, width, height } = pendingCover;
+      validateImageDocument({ images });
       const tag = await getNextTag();
-      const docRef = await itemsCol.add({
+      const docRef = itemsCol.doc();
+      const imageRevision = crypto.randomUUID();
+      const batch = db.batch();
+      batch.set(docRef, {
         tag,
         category,
         specs,
-        thumb: pendingThumb,
-        imageCount: pendingImages.length,
+        thumb,
+        imageCount: images.length,
+        coverVersion: CATALOG_COVER_VERSION,
+        imageRevision,
         createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       });
-      // full-res images live in a separate collection so the catalog listing
-      // (onSnapshot on itemsCol) never has to download them up front
-      await itemImagesCol.doc(docRef.id).set({ images: pendingImages });
+      batch.set(itemImagesCol.doc(docRef.id), { images });
+      batch.set(itemCoversCol.doc(docRef.id), {
+        image,
+        width,
+        height,
+        imageRevision,
+      });
+      await batch.commit();
+      if (disposed) return;
       statusEl.textContent = `Готово — присвоен ${tag}`;
       statusEl.className = "status-msg ok";
       pendingImages = [];
-      pendingThumb = null;
+      pendingCover = null;
       previewThumbs.innerHTML = "";
       updateFileInputMode();
       resetSpecFields();
       fileInput.value = "";
     } catch (err) {
       console.error(err);
-      statusEl.textContent = "Ошибка загрузки. Проверьте Firebase.";
-      statusEl.className = "status-msg err";
+      if (!disposed) {
+        statusEl.textContent =
+          "Не удалось загрузить изделие. Попробуйте ещё раз.";
+        statusEl.className = "status-msg err";
+      }
     } finally {
-      btn.disabled = false;
+      if (!disposed) {
+        btn.disabled = false;
+        fileInput.disabled = false;
+      }
     }
   });
 
@@ -721,12 +898,16 @@ export function initializeCatalog(root) {
 
   /* ---------- ADMIN LIST + DELETE ---------- */
   function legacyItems() {
-    return ALL_ITEMS.filter((i) => !i.thumb && itemImages(i).length);
+    return ALL_ITEMS.filter(
+      (item) =>
+        item.coverVersion !== CATALOG_COVER_VERSION || !item.imageRevision,
+    );
   }
 
   function renderAdminList() {
     const migrateBox = find("migrateBox");
-    migrateBox.style.display = legacyItems().length ? "block" : "none";
+    migrateBox.style.display =
+      optimizing || legacyItems().length ? "block" : "none";
 
     const list = find("adminList");
     if (ALL_ITEMS.length === 0) {
@@ -739,8 +920,8 @@ export function initializeCatalog(root) {
       <div class="admin-list-row">
         <img src="${itemThumbSrc(i)}" alt="" loading="lazy" decoding="async">
         <div class="info">
-          <div class="tag">${i.tag}${count > 1 ? ` (${count} фото)` : ""}</div>
-          <div class="cat">${catLabel(i.category)}${(i.specs || []).map((s) => " · " + s.name + ": " + s.value).join("")}</div>
+          <div class="tag">${escapeHtml(i.tag)}${count > 1 ? ` (${count} фото)` : ""}</div>
+          <div class="cat">${escapeHtml(catLabel(i.category))}${(i.specs || []).map((s) => " · " + escapeHtml(s.name) + ": " + escapeHtml(s.value)).join("")}</div>
         </div>
         <button class="del-btn" data-id="${i.id}">Удалить</button>
       </div>
@@ -749,52 +930,85 @@ export function initializeCatalog(root) {
     list.querySelectorAll(".del-btn").forEach((b) => {
       listen(b, "click", async () => {
         if (!confirm("Удалить это изделие?")) return;
-        await Promise.all([
-          itemsCol.doc(b.dataset.id).delete(),
-          itemImagesCol
-            .doc(b.dataset.id)
-            .delete()
-            .catch(() => {}),
-        ]);
+        b.disabled = true;
+        try {
+          const batch = db.batch();
+          batch.delete(itemsCol.doc(b.dataset.id));
+          batch.delete(itemImagesCol.doc(b.dataset.id));
+          batch.delete(itemCoversCol.doc(b.dataset.id));
+          await batch.commit();
+        } catch (err) {
+          console.error(err);
+          if (!disposed) {
+            b.disabled = false;
+            alert("Не удалось удалить изделие. Попробуйте ещё раз.");
+          }
+        }
       });
     });
   }
 
-  /* ---------- MIGRATE LEGACY ITEMS (move inline images out of the listing) ---------- */
+  /* ---------- ONE-TIME CATALOG COVER OPTIMIZATION ---------- */
   listen(find("migrateBtn"), "click", async () => {
+    if (optimizing) return;
     const btn = find("migrateBtn");
     const statusEl = find("migrateStatus");
     const legacy = legacyItems();
-    if (legacy.length === 0) {
+    if (!legacy.length) {
       statusEl.textContent = "Все изделия уже оптимизированы.";
       statusEl.className = "status-msg ok";
       return;
     }
+    optimizing = true;
     btn.disabled = true;
     let done = 0,
       failed = 0;
     for (const item of legacy) {
-      statusEl.textContent = `Оптимизация ${done + failed + 1} из ${legacy.length}...`;
+      if (disposed) break;
+      statusEl.textContent = `Оптимизация ${done + failed + 1} из ${legacy.length}…`;
       statusEl.className = "status-msg";
       try {
-        const images = itemImages(item);
-        const thumb = await compressDataUrl(images[0], 1200, 0.85);
-        await itemImagesCol.doc(item.id).set({ images });
-        await itemsCol.doc(item.id).update({
+        const images = await getFullImages(item);
+        if (!images[0]) throw new Error("No original image available");
+        const { image, thumb, width, height } = await createCatalogPreview(
+          images[0],
+        );
+        validateImageDocument({ image });
+        if (disposed) break;
+        const imageRevision = crypto.randomUUID();
+        const batch = db.batch();
+        batch.set(itemCoversCol.doc(item.id), {
+          image,
+          width,
+          height,
+          imageRevision,
+        });
+        const changes = {
           thumb,
           imageCount: images.length,
-          images: firebase.firestore.FieldValue.delete(),
-          image: firebase.firestore.FieldValue.delete(),
-        });
+          coverVersion: CATALOG_COVER_VERSION,
+          imageRevision,
+        };
+        // Preserve every full-size image; old inline galleries move atomically.
+        if (itemImages(item).length) {
+          validateImageDocument({ images });
+          batch.set(itemImagesCol.doc(item.id), { images });
+          changes.images = firebase.firestore.FieldValue.delete();
+          changes.image = firebase.firestore.FieldValue.delete();
+        }
+        batch.update(itemsCol.doc(item.id), changes);
+        await batch.commit();
         done++;
       } catch (err) {
-        console.error("migrate failed for", item.id, err);
+        console.error("Cover optimization failed:", item.id, err);
         failed++;
       }
     }
+    optimizing = false;
+    if (disposed) return;
     statusEl.textContent = failed
-      ? `Готово: ${done} оптимизировано, ${failed} с ошибкой.`
-      : `Готово: оптимизировано ${done} изделий. Каталог теперь загружается быстрее.`;
+      ? `Готово: ${done} оптимизировано, ${failed} с ошибкой. Повторите попытку.`
+      : `Готово: оптимизировано ${done} изделий. Исходные фотографии сохранены.`;
     statusEl.className = failed ? "status-msg err" : "status-msg ok";
     btn.disabled = false;
   });

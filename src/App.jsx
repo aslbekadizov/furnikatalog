@@ -145,6 +145,10 @@ function Lightbox() {
         <span className="lb-counter" id="lbCounter"></span>
       </div>
       <div className="lb-info">
+        <span className="lb-load-status" id="lbLoadStatus" role="status"></span>
+        <button className="back-btn" id="lbRetry" type="button" hidden>
+          Повторить загрузку фото
+        </button>
         <span className="card-tag" id="lbTag"></span>
         <span className="card-cat" id="lbCat"></span>
         <h4 className="lb-specs-title" id="lbSpecsTitle">
@@ -211,10 +215,9 @@ function AdminPanel() {
               lineHeight: "1.5",
             }}
           >
-            Часть изделий была загружена до оптимизации и хранит полноразмерные
-            фото прямо в списке каталога — из-за этого сайт долго грузится при
-            входе. Нажмите кнопку, чтобы сжать превью для таких изделий (фото
-            никуда не пропадут, только ускорится каталог).
+            Подготовьте чёткие фотографии для карточек, чтобы каталог открывался
+            быстрее. Все исходные фотографии сохранятся и будут доступны при
+            открытии изделия.
           </p>
           <button className="submit-btn" id="migrateBtn">
             Оптимизировать старые изделия

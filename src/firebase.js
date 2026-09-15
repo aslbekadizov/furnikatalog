@@ -15,4 +15,8 @@ const app = firebase.apps.length
   : firebase.initializeApp(firebaseConfig);
 
 export const db = app.firestore();
+// Reuse the saved catalog immediately, then receive fresh data from the server.
+void db.enablePersistence({ synchronizeTabs: true }).catch(() => {
+  // Restricted browser storage falls back to the normal in-memory cache.
+});
 export { firebase };

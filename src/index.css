@@ -125,6 +125,14 @@
   }
   .card-cat{color:var(--muted); font-size:12.5px;}
   .card-img-wrap{position:relative;}
+  .card-img{height:auto;}
+  .image-loading{background:linear-gradient(110deg,var(--bg-soft),var(--surface-hi),var(--bg-soft)); background-size:200% 100%; animation:photoLoading 1.4s linear infinite;}
+  @keyframes photoLoading{to{background-position:-200% 0;}}
+  .image-retry{display:none; position:absolute; inset:35% 12%; border:1px solid var(--brass); border-radius:8px; background:var(--surface); color:var(--cream); cursor:pointer;}
+  .image-error .image-retry{display:block;}
+  .lb-load-status{font-size:13px; color:var(--muted);}
+  .lb-load-status:empty{display:none;}
+  @media(prefers-reduced-motion:reduce){.image-loading{animation:none;}}
   .card-img-count{
     position:absolute; bottom:8px; right:8px; background:rgba(10,14,20,.72); color:var(--cream);
     font-family:'JetBrains Mono',monospace; font-size:11.5px; padding:3px 8px; border-radius:6px;
