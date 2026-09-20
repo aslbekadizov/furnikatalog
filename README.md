@@ -46,7 +46,9 @@ Baza, JWT va R2 maxfiy ma’lumotlari faqat backendda qoladi.
 
 ## Rasmlar va yangilanishlar
 
-- Kartochka yaqinlashganda birinchi katta rasm yuklanadi; kichik 500px `thumb`
+- Birinchi qatordagi rasmlar darhol, keyingi qatorlar ekran chegarasiga 1.5 ekran
+  qolganda yuklana boshlaydi. Oyna o‘lchami o‘zgarsa, ustunlar va masofa qayta hisoblanadi.
+  Har bir kartochka uchun birinchi katta rasm olinadi; kichik 500px `thumb`
   admin ro‘yxati uchungina ishlatiladi. Parallel rasm yuklash soni 5 bilan cheklangan.
 - Berilgan backend `items/<uuid>/thumb.jpg` va `items/<uuid>/0.jpg` yaratadi.
   Klient shu shartnomadan foydalanadi. Agar API `cover` URL qaytarsa, u ustun;

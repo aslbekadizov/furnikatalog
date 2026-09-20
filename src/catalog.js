@@ -237,8 +237,12 @@ export function initializeCatalog(root) {
   const IMG_CONCURRENCY = 5;
   let imgActive = 0;
   const imgQueue = [];
+  const queuedImages = new WeakSet();
+  let preloadDistance = Math.round(window.innerHeight * 1.5);
 
   function queueImageLoad(img) {
+    if (queuedImages.has(img)) return;
+    queuedImages.add(img);
     img.closest(".card-img-wrap").classList.remove("image-error");
     img.closest(".card-img-wrap").classList.add("image-loading");
     imgQueue.push(img);
@@ -248,14 +252,23 @@ export function initializeCatalog(root) {
   function pumpImageQueue() {
     while (!disposed && imgActive < IMG_CONCURRENCY && imgQueue.length) {
       const img = imgQueue.shift();
-      if (!img.isConnected) continue;
+      if (!img.isConnected) {
+        queuedImages.delete(img);
+        continue;
+      }
       const rect = img.getBoundingClientRect();
-      if (rect.bottom < -300 || rect.top > window.innerHeight + 300) {
+      if (
+        img.loading !== "eager" &&
+        (rect.bottom < -preloadDistance ||
+          rect.top > window.innerHeight + preloadDistance)
+      ) {
+        queuedImages.delete(img);
         gridImgObserver.observe(img);
         continue;
       }
       imgActive++;
       loadGridImage(img).finally(() => {
+        queuedImages.delete(img);
         imgActive--;
         pumpImageQueue();
       });
@@ -280,21 +293,45 @@ export function initializeCatalog(root) {
     }
   }
 
-  const gridImgObserver = new IntersectionObserver(
-    (entries) => {
-      entries.forEach((entry) => {
-        if (entry.isIntersecting) {
-          gridImgObserver.unobserve(entry.target);
-          queueImageLoad(entry.target);
-        }
-      });
-    },
-    { rootMargin: "300px 0px" },
-  );
+  function createGridObserver() {
+    return new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            gridImgObserver.unobserve(entry.target);
+            queueImageLoad(entry.target);
+          }
+        });
+      },
+      { rootMargin: `${preloadDistance}px 0px` },
+    );
+  }
+  let gridImgObserver = createGridObserver();
+
+  function scheduleGridImages() {
+    const grid = find("grid");
+    const columns =
+      getComputedStyle(grid).gridTemplateColumns.split(/\s+/).filter(Boolean)
+        .length || 1;
+    grid.querySelectorAll(".card-img").forEach((img, index) => {
+      // Start the actual first row even while the visitor is still in the intro.
+      img.loading = index < columns ? "eager" : "lazy";
+      if (img.src !== placeholder || queuedImages.has(img)) return;
+      if (index < columns) queueImageLoad(img);
+      else gridImgObserver.observe(img);
+    });
+  }
+  listen(window, "resize", () => {
+    preloadDistance = Math.round(window.innerHeight * 1.5);
+    gridImgObserver.disconnect();
+    gridImgObserver = createGridObserver();
+    scheduleGridImages();
+  });
 
   function renderGrid() {
     const grid = find("grid");
     gridImgObserver.disconnect();
+    imgQueue.forEach((img) => queuedImages.delete(img));
     imgQueue.length = 0;
     let items =
       activeCategory === "all"
@@ -340,9 +377,7 @@ export function initializeCatalog(root) {
         queueImageLoad(card.querySelector(".card-img"));
       });
     });
-    grid.querySelectorAll(".card-img").forEach((img) => {
-      if (img.src === placeholder) gridImgObserver.observe(img);
-    });
+    scheduleGridImages();
   }
 
   /* ---------- ID SEARCH ---------- */
