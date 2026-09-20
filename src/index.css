@@ -343,3 +343,11 @@
     #galImg1{ clip-path:inset(0 0 0 50%); }
     .intro-logo{ transform:translate(-50%,-50%) scale(1.25) scaleX(.8) scaleY(.86); }
   }
+
+.admin-login{width:min(420px,calc(100% - 32px));padding:28px;border:1px solid var(--brass);border-radius:16px;background:var(--surface);color:var(--cream);}
+.admin-login::backdrop{background:rgba(0,0,0,.7);}
+.admin-login h3{margin:0 0 20px;}
+.admin-login input{width:100%;box-sizing:border-box;}
+.admin-login .back-btn{margin-top:12px;width:100%;}
+.admin-head{flex-wrap:wrap;gap:12px;}
+#catalogRetry{margin-bottom:16px;}

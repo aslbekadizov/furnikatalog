@@ -24,6 +24,7 @@ export default function App() {
         <Catalog />
       </div>
       <Lightbox />
+      <AdminLogin />
       <AdminPanel />
     </div>
   );
@@ -128,6 +129,10 @@ function Catalog() {
 
       <div className="cat-rail" id="catRail"></div>
 
+      <div className="status-msg err" id="catalogStatus" role="status"></div>
+      <button className="back-btn" id="catalogRetry" type="button" hidden>
+        Повторить загрузку
+      </button>
       <div className="grid" id="grid"></div>
     </main>
   );
@@ -171,6 +176,9 @@ function AdminPanel() {
               Админ<span> панель</span>
             </div>
           </div>
+          <button className="back-btn" id="logoutAdmin">
+            Выйти из аккаунта
+          </button>
           <button className="back-btn" id="closeAdmin">
             ← Назад в каталог
           </button>
@@ -205,26 +213,6 @@ function AdminPanel() {
           <div className="status-msg" id="uploadStatus"></div>
         </div>
 
-        <div className="upload-box" id="migrateBox" style={{ display: "none" }}>
-          <h3>Ускорить каталог</h3>
-          <p
-            style={{
-              color: "var(--muted)",
-              fontSize: "13.5px",
-              margin: "0 0 16px",
-              lineHeight: "1.5",
-            }}
-          >
-            Подготовьте чёткие фотографии для карточек, чтобы каталог открывался
-            быстрее. Все исходные фотографии сохранятся и будут доступны при
-            открытии изделия.
-          </p>
-          <button className="submit-btn" id="migrateBtn">
-            Оптимизировать старые изделия
-          </button>
-          <div className="status-msg" id="migrateStatus"></div>
-        </div>
-
         <h3
           style={{
             fontFamily: "'Space Grotesk',sans-serif",
@@ -237,5 +225,36 @@ function AdminPanel() {
         <div id="adminList"></div>
       </div>
     </div>
+  );
+}
+
+function AdminLogin() {
+  return (
+    <dialog
+      id="adminLogin"
+      className="admin-login"
+      aria-labelledby="loginTitle"
+    >
+      <form id="loginForm">
+        <h3 id="loginTitle">Вход администратора</h3>
+        <div className="field">
+          <label htmlFor="adminPassword">Пароль</label>
+          <input
+            id="adminPassword"
+            type="password"
+            autoComplete="current-password"
+            required
+            maxLength={200}
+          />
+        </div>
+        <div className="status-msg err" id="loginStatus" role="status"></div>
+        <button className="submit-btn" id="loginSubmit" type="submit">
+          Войти
+        </button>
+        <button className="back-btn" id="loginCancel" type="button">
+          Отмена
+        </button>
+      </form>
+    </dialog>
   );
 }
